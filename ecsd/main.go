@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,14 +25,17 @@ import (
 
 	"strconv"
 
+	pb "github.com/cipherowl-ai/addressdb/proto"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	"golang.org/x/time/rate"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 var (
 	filter               *store.BloomFilterStore
-	logger               = log.New(os.Stdout, "BloomServer: ", log.LstdFlags)
+	logger               = log.New(os.Stdout, "ECSd: ", log.LstdFlags)
 	lasterror            error
 	ratelimit            int
 	burst                int
@@ -69,6 +73,63 @@ type UpdateRequest struct {
 	URL string `json:"url"`
 }
 
+// gRPC server implementation
+type ecsdServer struct {
+	pb.UnimplementedECSdServer
+}
+
+// CheckAddress implements the gRPC CheckAddress method
+func (s *ecsdServer) CheckAddress(ctx context.Context, req *pb.CheckAddressRequest) (*pb.CheckAddressResponse, error) {
+	found, err := filter.CheckAddress(req.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.CheckAddressResponse{
+		Address: req.Address,
+		InSet:   found,
+	}, nil
+}
+
+// BatchCheckAddresses implements the gRPC BatchCheckAddresses method
+func (s *ecsdServer) BatchCheckAddresses(ctx context.Context, req *pb.BatchCheckRequest) (*pb.BatchCheckResponse, error) {
+	if len(req.Addresses) > 100 {
+		return nil, fmt.Errorf("too many addresses, maximum is 100")
+	}
+
+	found := make([]string, 0)
+	notFound := make([]string, 0)
+
+	for _, address := range req.Addresses {
+		if ok, err := filter.CheckAddress(address); ok && err == nil {
+			found = append(found, address)
+		} else {
+			notFound = append(notFound, address)
+		}
+	}
+
+	return &pb.BatchCheckResponse{
+		Found:         found,
+		NotFound:      notFound,
+		FoundCount:    int32(len(found)),
+		NotFoundCount: int32(len(notFound)),
+	}, nil
+}
+
+// InspectFilter implements the gRPC InspectFilter method
+func (s *ecsdServer) InspectFilter(ctx context.Context, req *pb.InspectRequest) (*pb.InspectResponse, error) {
+	stats := filter.GetStats()
+
+	return &pb.InspectResponse{
+		K:                 int32(stats.K),
+		M:                 int64(stats.M),
+		N:                 int64(stats.N),
+		EstimatedCapacity: int64(stats.EstimatedCapacity),
+		FalsePositiveRate: stats.FalsePositiveRate,
+		LastUpdate:        lastFilterLoadTime.Format(time.RFC3339),
+	}, nil
+}
+
 // The mapping of valid header values for efficient lookup
 var llmCallerValues = map[string]bool{
 	"on":   true,
@@ -98,7 +159,8 @@ func main() {
 
 	// Command line flags
 	filename := flag.String("f", "bloomfilter.gob", "Path to the .gob file containing the Bloom filter")
-	port := flag.Int("p", 8080, "Port to listen on")
+	port := flag.Int("p", 8080, "Port to listen on for HTTP")
+	grpcPort := flag.Int("gp", 9090, "Port to listen on for gRPC")
 	ratelimit_v := flag.Int("r", 20, "Ratelimit")
 	burst_v := flag.Int("b", 5, "Burst")
 	flag.StringVar(&privateKeyFile, "private-key-file", "", "Path to the private key file (optional)")
@@ -109,9 +171,12 @@ func main() {
 	ratelimit = *ratelimit_v
 	burst = *burst_v
 
-	logger.Printf("Starting with configuration: port=%d, ratelimit=%d, burst=%d, env=%s", *port, ratelimit, burst, environment)
+	logger.Printf("Starting with configuration: http-port=%d, grpc-port=%d, ratelimit=%d, burst=%d, env=%s",
+		*port, *grpcPort, ratelimit, burst, environment)
 
 	// Configure PGP handler if keys are provided
+	// TODO refine this to use the helper functions in the securedata package
+
 	var options []store.Option
 	if privateKeyFile != "" || publicKeyFile != "" {
 		pgpOptions := []securedata.Option{}
@@ -140,13 +205,9 @@ func main() {
 	}
 
 	// Then load the filter from file
-	lasterror = filter.LoadFromFile(*filename)
-	if lasterror != nil {
-		logger.Fatalf("Failed to load Bloom filter: %v", lasterror)
-	}
 
-	// Record initial load time
-	lastFilterLoadTime = time.Now().UTC()
+	// Record initial load time - to be 1970-01-01 00:00:00 UTC
+	lastFilterLoadTime = time.Unix(0, 0).UTC() // 1970-01-01 00:00:00 UTC
 
 	// Create a file watcher notifier.
 	notifier, err := reload.NewFileWatcherNotifier(*filename, 2*time.Second)
@@ -161,6 +222,7 @@ func main() {
 	}
 	defer manager.Stop()
 
+	// Start HTTP server
 	r := mux.NewRouter()
 	r.Use(loggingMiddleware)
 
@@ -171,7 +233,8 @@ func main() {
 	r.Handle("/update", updateRateLimitMiddleware(http.HandlerFunc(updateHandler))).Methods("PATCH") //limit patch requests, so backend won't get overwhelmed
 	r.Handle("/health", http.HandlerFunc(healthHandler)).Methods("GET")
 
-	srv := &http.Server{
+	// HTTP server
+	httpSrv := &http.Server{
 		Addr:         ":" + strconv.Itoa(*port),
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
@@ -179,14 +242,33 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
+	// Start HTTP server in a goroutine
 	go func() {
-		logger.Printf("Starting server on port %d", *port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Printf("Starting HTTP server on port %d", *port)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("Could not listen on %d: %v\n", *port, err)
 		}
 	}()
 
-	gracefulShutdown(srv)
+	// Start gRPC server in a goroutine
+	go func() {
+		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *grpcPort))
+		if err != nil {
+			logger.Fatalf("Failed to listen for gRPC: %v", err)
+		}
+
+		s := grpc.NewServer()
+		pb.RegisterECSdServer(s, &ecsdServer{})
+		// Enable reflection for debugging
+		reflection.Register(s)
+
+		logger.Printf("Starting gRPC server on port %d", *grpcPort)
+		if err := s.Serve(lis); err != nil {
+			logger.Fatalf("Failed to serve gRPC: %v", err)
+		}
+	}()
+
+	gracefulShutdown(httpSrv)
 }
 
 // Helper function to get environment variables with defaults
@@ -362,6 +444,9 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// test if BLOOMFILTER_PATH is set
+	// if it is set, download the file to the path
+	// if it is not set, create a temporary file
 	// Create temporary file
 	tempFile, err := os.CreateTemp("", "bloomfilter-*.gob")
 	if err != nil {
@@ -382,7 +467,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	// Load the new filter data directly into the existing filter
 	err = filter.LoadFromFile(tempFilePath)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error": "Failed to load new Bloom filter: %v"}`, err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to reload new Bloom filter: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
 
@@ -461,6 +546,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			"message": "Error details",
 			"filter":  "Bloom filter stats summary",
 		}
+	}
+
+	// if lastFilterLoadTime is more than 24 hour, call updateHandler
+	if time.Since(lastFilterLoadTime) > 24*time.Hour {
+		updateHandler(w, r)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
